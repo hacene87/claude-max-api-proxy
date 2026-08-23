@@ -505,17 +505,21 @@ async function handleStreamingResponse(
       if (!res.writableEnded) {
         // Send final done chunk with finish_reason and usage data
         const doneChunk = createDoneChunk(requestId, lastModel);
-        if (result.usage) {
+        if (result.usage || result.modelUsage) {
+          const muValues = Object.values(result.modelUsage || {});
+          const promptTokens = result.usage?.input_tokens
+            || muValues.reduce((s, m) => s + (m.inputTokens || 0), 0);
+          const completionTokens = result.usage?.output_tokens
+            || muValues.reduce((s, m) => s + (m.outputTokens || 0), 0);
           doneChunk.usage = {
-            prompt_tokens: result.usage.input_tokens || 0,
-            completion_tokens: result.usage.output_tokens || 0,
-            total_tokens:
-              (result.usage.input_tokens || 0) + (result.usage.output_tokens || 0),
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: promptTokens + completionTokens,
             // Prompt caching is automatic in Claude Code - surface the metrics
-            ...(result.usage.cache_read_input_tokens
+            ...(result.usage?.cache_read_input_tokens
               ? { cache_read_input_tokens: result.usage.cache_read_input_tokens }
               : {}),
-            ...(result.usage.cache_creation_input_tokens
+            ...(result.usage?.cache_creation_input_tokens
               ? { cache_creation_input_tokens: result.usage.cache_creation_input_tokens }
               : {}),
           };
