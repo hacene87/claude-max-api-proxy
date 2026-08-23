@@ -384,8 +384,12 @@ export class ClaudeSubprocess extends EventEmitter {
             console.error(`[Subprocess] Process closed with code: ${code}`);
           }
           this.clearTimeout();
-          // Process any remaining buffer
+          // Append newline before processing so an unterminated final line
+          // (no trailing \n from the CLI) isn't silently dropped by processBuffer's
+          // "keep incomplete line" logic — this is the most common cause of missing
+          // result events and the resulting empty-content responses.
           if (this.buffer.trim()) {
+            this.buffer += "\n";
             this.processBuffer();
           }
           this.emit("close", code);

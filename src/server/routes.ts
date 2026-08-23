@@ -572,7 +572,18 @@ async function handleStreamingResponse(
         if (sessionCtx.resume && sessionCtx.sessionKey) {
           clearSession(sessionCtx.sessionKey);
         }
-        if (!res.writableEnded) {
+        if (!res.writableEnded && subprocess.hasAuthError()) {
+          // Expired OAuth often surfaces only as a non-zero exit, not an "error" event
+          console.error("[Auth] Claude CLI authentication expired - user notified in chat");
+          const chunk = {
+            id: `chatcmpl-${requestId}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: lastModel,
+            choices: [{ index: 0, delta: { role: "assistant", content: AUTH_EXPIRED_MESSAGE }, finish_reason: null }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        } else if (!res.writableEnded) {
           // Abnormal exit without result - send error
           res.write(`data: ${JSON.stringify({
             error: { message: `Process exited with code ${code}`, type: "server_error", code: null },
@@ -580,6 +591,8 @@ async function handleStreamingResponse(
         }
       }
       if (!res.writableEnded) {
+        const closeDoneChunk = createDoneChunk(requestId, lastModel);
+        res.write(`data: ${JSON.stringify(closeDoneChunk)}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -593,9 +606,19 @@ async function handleStreamingResponse(
       resume: sessionCtx.resume,
       effort: cliInput.effort,
       disableBuiltinTools: cliInput.hasClientTools,
-    }).catch((err) => {
-      console.error("[Streaming] Subprocess start error:", err);
-      reject(err);
+    }).catch((err: Error) => {
+      // Spawn failure (e.g. ENOENT) - SSE headers are already flushed, so the
+      // outer catch can't send a JSON error. End the stream here instead of
+      // leaking the connection.
+      console.error("[Streaming] Subprocess start error:", err.message);
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({
+          error: { message: err.message, type: "server_error", code: null },
+        })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
+      resolve();
     });
   });
 }
