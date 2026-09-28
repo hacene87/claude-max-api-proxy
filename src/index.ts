@@ -6,6 +6,7 @@
  */
 
 import { startServer, stopServer, getServer } from "./server/index.js";
+import { initApiKey } from "./server/auth.js";
 import { verifyClaude, verifyAuth } from "./subprocess/manager.js";
 
 // Provider constants
@@ -137,6 +138,10 @@ const claudeCodeCliPlugin = {
               await startServer({ port: serverPort });
               spin.stop("Claude CLI provider ready");
 
+              // The server requires this key (see server/auth.ts); null when
+              // PROXY_API_KEY=off
+              const apiKey = initApiKey().key;
+
               const baseUrl = `http://127.0.0.1:${serverPort}/v1`;
 
               return {
@@ -146,7 +151,7 @@ const claudeCodeCliPlugin = {
                     credential: {
                       type: "token",
                       provider: PROVIDER_ID,
-                      token: "local", // Dummy token - CLI handles auth
+                      token: apiKey ?? "local", // Proxy key - the CLI handles Claude auth
                     },
                   },
                 ],
@@ -155,9 +160,9 @@ const claudeCodeCliPlugin = {
                     providers: {
                       [PROVIDER_ID]: {
                         baseUrl,
-                        apiKey: "local",
+                        apiKey: apiKey ?? "local",
                         api: "openai-completions",
-                        authHeader: false,
+                        authHeader: apiKey !== null,
                         models: AVAILABLE_MODELS.map(buildModelDefinition),
                       },
                     },

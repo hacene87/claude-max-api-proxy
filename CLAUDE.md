@@ -50,6 +50,10 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openclaw.claude-max-
 launchctl list com.openclaw.claude-max-proxy
 ```
 
+## Authentication
+
+Every endpoint except `/health` requires `Authorization: Bearer <key>`. The key comes from `PROXY_API_KEY`; if unset, it is generated once and stored in `~/.claude-max-api-proxy/api-key` (mode 0600). Clients (OpenClaw, Hermes, OpenWebUI) must be configured with it. CORS is off by default (`CORS_ORIGINS` to allow origins) and only localhost `Host` headers are accepted when bound to 127.0.0.1 (`ALLOWED_HOSTS` to override). See `.env.example`.
+
 ## Architecture
 
 - `src/types/claude-cli.ts` - Claude CLI JSON streaming types and type guards

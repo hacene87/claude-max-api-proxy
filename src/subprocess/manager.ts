@@ -24,8 +24,14 @@ import {
   isToolUseBlockStart,
   isInputJsonDelta,
   isContentBlockStop,
+  isThinkingDelta,
 } from "../types/claude-cli.js";
-import type { ClaudeModel } from "../adapter/openai-to-cli.js";
+import type { ClaudeModel, CliImage, ClaudeEffort } from "../adapter/openai-to-cli.js";
+import os from "os";
+import { lookup as dnsLookup, type LookupAddress } from "dns";
+import http, { type IncomingMessage } from "http";
+import https from "https";
+import { BlockList, isIP, type LookupFunction } from "net";
 
 export interface SubprocessOptions {
   model: ClaudeModel;
@@ -34,7 +40,26 @@ export interface SubprocessOptions {
   resume?: boolean;
   cwd?: string;
   timeout?: number;
+  /** Reasoning effort passed through to the CLI via --effort */
+  effort?: ClaudeEffort;
+  /** Disable all built-in CLI tools (when the client provides its own tool list) */
+  disableBuiltinTools?: boolean;
+  /** Images to stage as temp files so Claude can Read them */
+  images?: CliImage[];
+  /** Keep the Read tool even when built-in tools are disabled (staged images) */
+  allowImageRead?: boolean;
 }
+
+/** Max size per image (decoded), 20 MB - generous but bounded */
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+const MIME_TO_EXT: Record<string, string> = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/jpg": ".jpg",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+};
 
 export interface SubprocessEvents {
   message: (msg: ClaudeCliMessage) => void;
@@ -46,6 +71,188 @@ export interface SubprocessEvents {
 }
 
 const DEFAULT_TIMEOUT = 900000; // 15 minutes
+
+/**
+ * Detect authentication/authorization failures from CLI stderr or exit codes.
+ * The CLI surfaces expired OAuth tokens as 401/authentication_error text on
+ * stderr (there is no structured error type in stream-json), so we match the
+ * known signatures.
+ */
+export function isAuthError(stderr: string, exitCode: number | null): boolean {
+  if (exitCode === 401) return true;
+  const text = stderr.toLowerCase();
+  return (
+    text.includes("authentication_error") ||
+    text.includes("authentication failed") ||
+    (text.includes("401") && text.includes("unauthorized")) ||
+    text.includes("oauth token has expired") ||
+    text.includes("token expired") ||
+    text.includes("invalid oauth token") ||
+    (text.includes("not logged in") && text.includes("claude")) ||
+    text.includes("please run /login") ||
+    text.includes("please run claude auth login")
+  );
+}
+
+/** Addresses a request-supplied image URL must never reach (SSRF) */
+const PRIVATE_ADDRESSES = new BlockList();
+for (const [net, bits] of [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+  ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.168.0.0", 16],
+  ["198.18.0.0", 15], ["224.0.0.0", 4], ["240.0.0.0", 4],
+] as const) {
+  PRIVATE_ADDRESSES.addSubnet(net, bits, "ipv4");
+}
+for (const [net, bits] of [
+  ["::", 128], ["::1", 128], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
+] as const) {
+  PRIVATE_ADDRESSES.addSubnet(net, bits, "ipv6");
+}
+
+function isPrivateAddress(address: string): boolean {
+  const mapped = address.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (mapped) return PRIVATE_ADDRESSES.check(mapped[1], "ipv4");
+  return PRIVATE_ADDRESSES.check(address, isIP(address) === 6 ? "ipv6" : "ipv4");
+}
+
+function allowPrivateImageUrls(): boolean {
+  return process.env.ALLOW_PRIVATE_IMAGE_URLS === "true";
+}
+
+/**
+ * DNS lookup used for the actual image connection. Checking the resolved
+ * address here (instead of resolving once up front and letting the request
+ * resolve again) closes the DNS-rebinding gap between check and connect.
+ */
+const guardedLookup: LookupFunction = (hostname, options, callback) => {
+  dnsLookup(hostname, { ...options, all: true }, (err, addresses) => {
+    if (err) return callback(err, "", 0);
+    if (!allowPrivateImageUrls() && (addresses.length === 0 || addresses.some((a) => isPrivateAddress(a.address)))) {
+      return callback(new Error(`Image URL host not allowed: ${hostname}`), "", 0);
+    }
+    if (options.all) return (callback as (e: null, a: LookupAddress[]) => void)(null, addresses);
+    callback(null, addresses[0].address, addresses[0].family);
+  });
+};
+
+/**
+ * Only public http(s) hosts may be fetched, so an image_url can't be used to
+ * reach localhost, the LAN or cloud metadata endpoints from this machine.
+ * Host names are checked in guardedLookup; IP literals skip DNS, so they
+ * are checked here. ALLOW_PRIVATE_IMAGE_URLS=true lifts the address check.
+ */
+function assertFetchableImageUrl(raw: string): URL {
+  const url = new URL(raw);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`Unsupported image URL protocol: ${url.protocol}`);
+  }
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  if (!allowPrivateImageUrls() && isIP(hostname) && isPrivateAddress(hostname)) {
+    throw new Error(`Image URL host not allowed: ${url.hostname}`);
+  }
+  return url;
+}
+
+function getOnce(url: URL, signal: AbortSignal): Promise<IncomingMessage> {
+  const client = url.protocol === "https:" ? https : http;
+  return new Promise((resolve, reject) => {
+    const req = client.get(url, { lookup: guardedLookup, signal }, resolve);
+    req.on("error", reject);
+  });
+}
+
+/** GET that re-validates every redirect hop against the SSRF rules */
+async function fetchImage(raw: string): Promise<IncomingMessage> {
+  // One deadline for all hops and the body download
+  const signal = AbortSignal.timeout(5000);
+  let url = assertFetchableImageUrl(raw);
+  for (let hop = 0; hop < 5; hop++) {
+    const res = await getOnce(url, signal);
+    const status = res.statusCode || 0;
+    const location = res.headers.location;
+    if (status < 300 || status >= 400 || !location) return res;
+    res.resume();
+    url = assertFetchableImageUrl(new URL(location, url).toString());
+  }
+  throw new Error("Too many redirects");
+}
+
+/**
+ * Stage request images as temp files so the CLI can read them via the Read tool.
+ * Returns absolute file paths. Caller is responsible for cleanup.
+ * Remote URLs are downloaded (5s timeout, bounded size).
+ */
+export async function stageImages(images: CliImage[]): Promise<string[]> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "cmap-img-"));
+  const paths: string[] = [];
+
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i];
+    try {
+      let buffer: Buffer;
+      let mime = img.mimeType;
+
+      if (img.sourceUrl) {
+        const res = await fetchImage(img.sourceUrl);
+        const status = res.statusCode || 0;
+        const contentLength = Number(res.headers["content-length"] || 0);
+        // Only stage real images - anything else would be handed to Claude's
+        // Read tool as a file and could be echoed back to the caller
+        const contentType = (res.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+        if (status < 200 || status >= 300 || contentLength > MAX_IMAGE_BYTES || !contentType.startsWith("image/")) {
+          res.destroy();
+          continue;
+        }
+        mime = mime || contentType;
+        // Enforce the size limit while streaming: abort as soon as the body
+        // exceeds MAX_IMAGE_BYTES instead of buffering unbounded data first
+        const chunks: Buffer[] = [];
+        let received = 0;
+        let tooLarge = false;
+        for await (const chunk of res) {
+          received += (chunk as Buffer).length;
+          if (received > MAX_IMAGE_BYTES) {
+            tooLarge = true;
+            break;
+          }
+          chunks.push(Buffer.from(chunk));
+        }
+        if (tooLarge) {
+          res.destroy();
+          continue;
+        }
+        buffer = Buffer.concat(chunks);
+      } else {
+        buffer = Buffer.from(img.data, "base64");
+      }
+
+      if (buffer.length === 0 || buffer.length > MAX_IMAGE_BYTES) continue;
+      const ext = MIME_TO_EXT[mime] || ".png";
+      const file = path.join(dir, `image-${i + 1}${ext}`);
+      await fs.writeFile(file, buffer);
+      paths.push(file);
+    } catch {
+      // Skip broken images silently - prompt text still goes through
+    }
+  }
+
+  // Nothing staged: callers only clean up returned paths, so remove the dir now
+  if (paths.length === 0) {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  return paths;
+}
+
+/** Best-effort cleanup of staged image files (whole temp dir) */
+export async function cleanupImages(paths: string[]): Promise<void> {
+  const dirs = new Set(paths.map((p) => path.dirname(p)));
+  for (const dir of dirs) {
+    if (dir.includes("cmap-img-")) {
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
 
 /**
  * System prompt appended to Claude CLI to map OpenClaw tool names to Claude Code equivalents.
@@ -106,7 +313,7 @@ const OPENCLAW_TOOL_MAPPING_PROMPT = [
  */
 let resolvedClaudeBin: { bin: string; shell: boolean } | null = null;
 
-function resolveClaudeBin(): { bin: string; shell: boolean } {
+export function resolveClaudeBin(): { bin: string; shell: boolean } {
   if (process.env.CLAUDE_BIN) {
     // Environment overrides are intentionally not cached. This lets callers
     // temporarily select a binary without contaminating later resolutions.
@@ -194,6 +401,8 @@ function killProcessTree(
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer: string = "";
+  private stderrBuffer: string = "";
+  private exitCode: number | null = null;
   private timeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
 
@@ -213,7 +422,8 @@ export class ClaudeSubprocess extends EventEmitter {
         // Use spawn() for security - no shell interpretation
         const { bin, shell } = resolveClaudeBin();
         this.process = spawn(bin, args, {
-          cwd: options.cwd || process.cwd(),
+          // CLAUDE_WORKDIR confines where the CLI's file tools start from
+          cwd: options.cwd || process.env.CLAUDE_WORKDIR || process.cwd(),
           env: Object.fromEntries(
             Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
           ),
@@ -255,10 +465,12 @@ export class ClaudeSubprocess extends EventEmitter {
           this.processBuffer();
         });
 
-        // Capture stderr for debugging
+        // Capture stderr for debugging and auth-error detection
         this.process.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
+            // Keep a bounded tail (4 KB) - enough for error signatures
+            this.stderrBuffer = (this.stderrBuffer + errorText + "\n").slice(-4096);
             // Don't emit as error unless it's actually an error
             // Claude CLI may write debug info to stderr
             if (process.env.DEBUG_SUBPROCESS) {
@@ -269,12 +481,17 @@ export class ClaudeSubprocess extends EventEmitter {
 
         // Handle process close
         this.process.on("close", (code) => {
+          this.exitCode = code;
           if (process.env.DEBUG_SUBPROCESS) {
             console.error(`[Subprocess] Process closed with code: ${code}`);
           }
           this.clearTimeout();
-          // Process any remaining buffer
+          // Append newline before processing so an unterminated final line
+          // (no trailing \n from the CLI) isn't silently dropped by processBuffer's
+          // "keep incomplete line" logic — this is the most common cause of missing
+          // result events and the resulting empty-content responses.
           if (this.buffer.trim()) {
+            this.buffer += "\n";
             this.processBuffer();
           }
           this.emit("close", code);
@@ -306,6 +523,26 @@ export class ClaudeSubprocess extends EventEmitter {
       OPENCLAW_TOOL_MAPPING_PROMPT,
       // Prompt is passed via stdin (avoids E2BIG on large inputs)
     ];
+
+    if (options.effort) {
+      args.push("--effort", options.effort);
+    }
+
+    // Client-provided tools (OpenAI function calling): the CLI must NOT execute
+    // anything itself - no Bash, no Read, nothing. Execution happens client-side.
+    if (options.disableBuiltinTools) {
+      // Read only when the request carries images - it has to open them
+      args.push("--tools", options.allowImageRead ? "Read" : "");
+    } else if (process.env.CLAUDE_TOOLS !== undefined) {
+      // Operator-restricted tool set, e.g. "" (none) or "Read,WebSearch".
+      // Vision needs Read to open staged images.
+      args.push("--tools", process.env.CLAUDE_TOOLS.trim());
+    }
+    if (options.disableBuiltinTools || process.env.CLAUDE_TOOLS !== undefined) {
+      // --tools only covers built-in tools; without this, MCP servers from the
+      // user's Claude config would still load and run unprompted
+      args.push("--strict-mcp-config");
+    }
 
     if (options.sessionId && options.resume) {
       // Continue a previously persisted session — avoids replaying full history
@@ -358,6 +595,9 @@ export class ClaudeSubprocess extends EventEmitter {
         if (isContentDelta(message)) {
           // Emit content delta for streaming (text_delta only)
           this.emit("content_delta", message as ClaudeCliStreamEvent);
+        } else if (isThinkingDelta(message)) {
+          // Extended thinking stream (visible when effort > default)
+          this.emit("thinking_delta", message as unknown as ClaudeCliStreamEvent);
         } else if (isAssistantMessage(message)) {
           this.emit("assistant", message);
         } else if (isResultMessage(message)) {
@@ -388,6 +628,14 @@ export class ClaudeSubprocess extends EventEmitter {
       this.clearTimeout();
       this.isKilled = killProcessTree(this.process, signal);
     }
+  }
+
+  /**
+   * True if the subprocess failed due to an authentication problem
+   * (expired OAuth token, logged out). Check after "close"/"error".
+   */
+  hasAuthError(): boolean {
+    return isAuthError(this.stderrBuffer, this.exitCode);
   }
 
   /**
