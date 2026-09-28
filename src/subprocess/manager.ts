@@ -28,8 +28,10 @@ import {
 } from "../types/claude-cli.js";
 import type { ClaudeModel, CliImage, ClaudeEffort } from "../adapter/openai-to-cli.js";
 import os from "os";
-import { lookup } from "dns/promises";
-import { BlockList, isIP } from "net";
+import { lookup as dnsLookup, type LookupAddress } from "dns";
+import http, { type IncomingMessage } from "http";
+import https from "https";
+import { BlockList, isIP, type LookupFunction } from "net";
 
 export interface SubprocessOptions {
   model: ClaudeModel;
@@ -111,38 +113,64 @@ function isPrivateAddress(address: string): boolean {
   return PRIVATE_ADDRESSES.check(address, isIP(address) === 6 ? "ipv6" : "ipv4");
 }
 
+function allowPrivateImageUrls(): boolean {
+  return process.env.ALLOW_PRIVATE_IMAGE_URLS === "true";
+}
+
+/**
+ * DNS lookup used for the actual image connection. Checking the resolved
+ * address here (instead of resolving once up front and letting the request
+ * resolve again) closes the DNS-rebinding gap between check and connect.
+ */
+const guardedLookup: LookupFunction = (hostname, options, callback) => {
+  dnsLookup(hostname, { ...options, all: true }, (err, addresses) => {
+    if (err) return callback(err, "", 0);
+    if (!allowPrivateImageUrls() && (addresses.length === 0 || addresses.some((a) => isPrivateAddress(a.address)))) {
+      return callback(new Error(`Image URL host not allowed: ${hostname}`), "", 0);
+    }
+    if (options.all) return (callback as (e: null, a: LookupAddress[]) => void)(null, addresses);
+    callback(null, addresses[0].address, addresses[0].family);
+  });
+};
+
 /**
  * Only public http(s) hosts may be fetched, so an image_url can't be used to
  * reach localhost, the LAN or cloud metadata endpoints from this machine.
- * ALLOW_PRIVATE_IMAGE_URLS=true lifts the address check (e.g. a LAN image host).
+ * Host names are checked in guardedLookup; IP literals skip DNS, so they
+ * are checked here. ALLOW_PRIVATE_IMAGE_URLS=true lifts the address check.
  */
-async function assertFetchableImageUrl(raw: string): Promise<URL> {
+function assertFetchableImageUrl(raw: string): URL {
   const url = new URL(raw);
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error(`Unsupported image URL protocol: ${url.protocol}`);
   }
-  if (process.env.ALLOW_PRIVATE_IMAGE_URLS === "true") return url;
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
-  const addresses = isIP(hostname)
-    ? [hostname]
-    : (await lookup(hostname, { all: true })).map((a) => a.address);
-  if (addresses.length === 0 || addresses.some(isPrivateAddress)) {
+  if (!allowPrivateImageUrls() && isIP(hostname) && isPrivateAddress(hostname)) {
     throw new Error(`Image URL host not allowed: ${url.hostname}`);
   }
   return url;
 }
 
-/** fetch() that re-validates every redirect hop against the SSRF rules */
-async function fetchImage(raw: string): Promise<globalThis.Response> {
-  let url = await assertFetchableImageUrl(raw);
+function getOnce(url: URL, signal: AbortSignal): Promise<IncomingMessage> {
+  const client = url.protocol === "https:" ? https : http;
+  return new Promise((resolve, reject) => {
+    const req = client.get(url, { lookup: guardedLookup, signal }, resolve);
+    req.on("error", reject);
+  });
+}
+
+/** GET that re-validates every redirect hop against the SSRF rules */
+async function fetchImage(raw: string): Promise<IncomingMessage> {
+  // One deadline for all hops and the body download
+  const signal = AbortSignal.timeout(5000);
+  let url = assertFetchableImageUrl(raw);
   for (let hop = 0; hop < 5; hop++) {
-    const res = await fetch(url, {
-      redirect: "manual",
-      signal: AbortSignal.timeout(5000),
-    });
-    const location = res.headers.get("location");
-    if (res.status < 300 || res.status >= 400 || !location) return res;
-    url = await assertFetchableImageUrl(new URL(location, url).toString());
+    const res = await getOnce(url, signal);
+    const status = res.statusCode || 0;
+    const location = res.headers.location;
+    if (status < 300 || status >= 400 || !location) return res;
+    res.resume();
+    url = assertFetchableImageUrl(new URL(location, url).toString());
   }
   throw new Error("Too many redirects");
 }
@@ -164,20 +192,22 @@ export async function stageImages(images: CliImage[]): Promise<string[]> {
 
       if (img.sourceUrl) {
         const res = await fetchImage(img.sourceUrl);
-        if (!res.ok || !res.body) continue;
-        const contentLength = Number(res.headers.get("content-length") || 0);
-        if (contentLength > MAX_IMAGE_BYTES) continue;
+        const status = res.statusCode || 0;
+        const contentLength = Number(res.headers["content-length"] || 0);
         // Only stage real images - anything else would be handed to Claude's
         // Read tool as a file and could be echoed back to the caller
-        const contentType = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
-        if (!contentType.startsWith("image/")) continue;
+        const contentType = (res.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+        if (status < 200 || status >= 300 || contentLength > MAX_IMAGE_BYTES || !contentType.startsWith("image/")) {
+          res.destroy();
+          continue;
+        }
         mime = mime || contentType;
         // Enforce the size limit while streaming: abort as soon as the body
         // exceeds MAX_IMAGE_BYTES instead of buffering unbounded data first
         const chunks: Buffer[] = [];
         let received = 0;
         let tooLarge = false;
-        for await (const chunk of res.body) {
+        for await (const chunk of res) {
           received += (chunk as Buffer).length;
           if (received > MAX_IMAGE_BYTES) {
             tooLarge = true;
@@ -185,7 +215,10 @@ export async function stageImages(images: CliImage[]): Promise<string[]> {
           }
           chunks.push(Buffer.from(chunk));
         }
-        if (tooLarge) continue;
+        if (tooLarge) {
+          res.destroy();
+          continue;
+        }
         buffer = Buffer.concat(chunks);
       } else {
         buffer = Buffer.from(img.data, "base64");
@@ -382,7 +415,8 @@ export class ClaudeSubprocess extends EventEmitter {
         // Use spawn() for security - no shell interpretation
         const { bin, shell } = resolveClaudeBin();
         this.process = spawn(bin, args, {
-          cwd: options.cwd || process.cwd(),
+          // CLAUDE_WORKDIR confines where the CLI's file tools start from
+          cwd: options.cwd || process.env.CLAUDE_WORKDIR || process.cwd(),
           env: Object.fromEntries(
             Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
           ),
@@ -491,6 +525,10 @@ export class ClaudeSubprocess extends EventEmitter {
     // anything itself - no Bash, no Read, nothing. Execution happens client-side.
     if (options.disableBuiltinTools) {
       args.push("--tools", "");
+    } else if (process.env.CLAUDE_TOOLS !== undefined) {
+      // Operator-restricted tool set, e.g. "" (none) or "Read,WebSearch".
+      // Vision needs Read to open staged images.
+      args.push("--tools", process.env.CLAUDE_TOOLS.trim());
     }
 
     if (options.sessionId && options.resume) {

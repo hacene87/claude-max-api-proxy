@@ -7,12 +7,13 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { request } from "node:http";
+import { request, createServer } from "node:http";
 import type { AddressInfo } from "net";
 import { startServer, stopServer } from "./index.js";
 import { stageImages } from "../subprocess/manager.js";
 
 const KEY = "sk-proxy-test-key";
+const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
 let port: number;
 
 function call(
@@ -110,9 +111,36 @@ describe("image URL SSRF guard", () => {
     assert.deepEqual(paths, []);
   });
 
+  it("with ALLOW_PRIVATE_IMAGE_URLS, stages images but never non-image bodies", async () => {
+    const png = Buffer.from(PNG, "base64");
+    const imgServer = createServer((req, res) => {
+      if (req.url === "/img.png") {
+        res.writeHead(200, { "Content-Type": "image/png" }).end(png);
+      } else if (req.url === "/redirect") {
+        res.writeHead(302, { Location: "/img.png" }).end();
+      } else {
+        res.writeHead(200, { "Content-Type": "text/plain" }).end("secret");
+      }
+    });
+    await new Promise<void>((r) => imgServer.listen(0, "127.0.0.1", r));
+    const base = `http://localhost:${(imgServer.address() as AddressInfo).port}`;
+    process.env.ALLOW_PRIVATE_IMAGE_URLS = "true";
+    try {
+      const paths = await stageImages([
+        { mimeType: "", data: "", sourceUrl: `${base}/img.png` },
+        { mimeType: "", data: "", sourceUrl: `${base}/redirect` },
+        { mimeType: "", data: "", sourceUrl: `${base}/secret.txt` },
+      ]);
+      assert.equal(paths.length, 2);
+      assert.ok(paths.every((p) => p.endsWith(".png")));
+    } finally {
+      delete process.env.ALLOW_PRIVATE_IMAGE_URLS;
+      imgServer.close();
+    }
+  });
+
   it("still stages inline base64 images", async () => {
-    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
-    const paths = await stageImages([{ mimeType: "image/png", data: png }]);
+    const paths = await stageImages([{ mimeType: "image/png", data: PNG }]);
     assert.equal(paths.length, 1);
   });
 });
