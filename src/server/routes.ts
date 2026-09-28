@@ -200,6 +200,7 @@ export async function handleChatCompletions(
       stagedImages = await stageImages(cliInput.images);
       delete cliInput.images; // don't hold base64 in memory longer than needed
       if (stagedImages.length > 0) {
+        cliInput.hasStagedImages = true;
         const listing = stagedImages.map((p, i) => `${i + 1}. ${p}`).join("\n");
         cliInput.prompt =
           `[Attached images - use your Read tool on each file to view them]\n${listing}\n\n` +
@@ -561,6 +562,7 @@ async function handleStreamingResponse(
             error: { message: error.message, type: "server_error", code: null },
           })}\n\n`
         );
+        res.write("data: [DONE]\n\n");
         res.end();
       }
       resolve();
@@ -606,6 +608,7 @@ async function handleStreamingResponse(
       resume: sessionCtx.resume,
       effort: cliInput.effort,
       disableBuiltinTools: cliInput.hasClientTools,
+      allowImageRead: cliInput.hasStagedImages,
     }).catch((err: Error) => {
       // Spawn failure (e.g. ENOENT) - SSE headers are already flushed, so the
       // outer catch can't send a JSON error. End the stream here instead of
@@ -662,6 +665,10 @@ async function handleNonStreamingResponse(
       if (sessionCtx.resume && sessionCtx.sessionKey) {
         clearSession(sessionCtx.sessionKey);
       }
+      if (res.headersSent) {
+        resolve();
+        return;
+      }
       if (subprocess.hasAuthError()) {
         console.error("[Auth] Claude CLI authentication expired - user notified in chat");
         res.json(authExpiredResponse(requestId, "claude-sonnet-4"));
@@ -682,6 +689,12 @@ async function handleNonStreamingResponse(
       if (finalResult) {
         if (sessionCtx.sessionKey && cliInput.sessionId) {
           setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
+        }
+        // The error handler (e.g. timeout) may already have answered while
+        // the process kept running; a second res.json would throw
+        if (res.headersSent) {
+          resolve();
+          return;
         }
         // Client-tool request? Convert <tool_call> text into OpenAI tool_calls
         if (cliInput.hasClientTools) {
@@ -748,8 +761,13 @@ async function handleNonStreamingResponse(
         resume: sessionCtx.resume,
         effort: cliInput.effort,
         disableBuiltinTools: cliInput.hasClientTools,
+        allowImageRead: cliInput.hasStagedImages,
       })
       .catch((error) => {
+        if (res.headersSent) {
+          resolve();
+          return;
+        }
         res.status(500).json({
           error: {
             message: error.message,

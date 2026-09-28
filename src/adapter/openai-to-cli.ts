@@ -28,6 +28,8 @@ export interface CliInput {
   tools?: OpenAIToolDefinition[];
   /** True when the client sent tools - the CLI's built-in tools must be disabled then */
   hasClientTools?: boolean;
+  /** Set by the route once images are staged: the CLI needs Read to open them */
+  hasStagedImages?: boolean;
 }
 
 const EFFORT_LEVELS: ClaudeEffort[] = ["low", "medium", "high", "xhigh", "max"];
@@ -37,7 +39,9 @@ const EFFORT_LEVELS: ClaudeEffort[] = ["low", "medium", "high", "xhigh", "max"];
  * Unknown values are ignored so the CLI default applies.
  */
 export function extractEffort(request: OpenAIChatRequest): ClaudeEffort | undefined {
-  const raw = (request.reasoning_effort || request.effort || "").toLowerCase().trim();
+  const value = request.reasoning_effort || request.effort;
+  if (typeof value !== "string") return undefined;
+  const raw = value.toLowerCase().trim();
   return (EFFORT_LEVELS as string[]).includes(raw) ? (raw as ClaudeEffort) : undefined;
 }
 
@@ -112,7 +116,7 @@ export function extractImages(messages: OpenAIChatRequest["messages"]): CliImage
   for (const msg of messages) {
     if (!Array.isArray(msg.content)) continue;
     for (const block of msg.content) {
-      if (block.type !== "image_url" || !block.image_url?.url) continue;
+      if (block.type !== "image_url" || typeof block.image_url?.url !== "string") continue;
       const url = block.image_url.url;
       const dataUrl = url.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
       if (dataUrl) {

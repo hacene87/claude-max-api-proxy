@@ -46,6 +46,8 @@ export interface SubprocessOptions {
   disableBuiltinTools?: boolean;
   /** Images to stage as temp files so Claude can Read them */
   images?: CliImage[];
+  /** Keep the Read tool even when built-in tools are disabled (staged images) */
+  allowImageRead?: boolean;
 }
 
 /** Max size per image (decoded), 20 MB - generous but bounded */
@@ -234,6 +236,11 @@ export async function stageImages(images: CliImage[]): Promise<string[]> {
     }
   }
 
+  // Nothing staged: callers only clean up returned paths, so remove the dir now
+  if (paths.length === 0) {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+
   return paths;
 }
 
@@ -306,7 +313,7 @@ const OPENCLAW_TOOL_MAPPING_PROMPT = [
  */
 let resolvedClaudeBin: { bin: string; shell: boolean } | null = null;
 
-function resolveClaudeBin(): { bin: string; shell: boolean } {
+export function resolveClaudeBin(): { bin: string; shell: boolean } {
   if (process.env.CLAUDE_BIN) {
     // Environment overrides are intentionally not cached. This lets callers
     // temporarily select a binary without contaminating later resolutions.
@@ -524,11 +531,17 @@ export class ClaudeSubprocess extends EventEmitter {
     // Client-provided tools (OpenAI function calling): the CLI must NOT execute
     // anything itself - no Bash, no Read, nothing. Execution happens client-side.
     if (options.disableBuiltinTools) {
-      args.push("--tools", "");
+      // Read only when the request carries images - it has to open them
+      args.push("--tools", options.allowImageRead ? "Read" : "");
     } else if (process.env.CLAUDE_TOOLS !== undefined) {
       // Operator-restricted tool set, e.g. "" (none) or "Read,WebSearch".
       // Vision needs Read to open staged images.
       args.push("--tools", process.env.CLAUDE_TOOLS.trim());
+    }
+    if (options.disableBuiltinTools || process.env.CLAUDE_TOOLS !== undefined) {
+      // --tools only covers built-in tools; without this, MCP servers from the
+      // user's Claude config would still load and run unprompted
+      args.push("--strict-mcp-config");
     }
 
     if (options.sessionId && options.resume) {

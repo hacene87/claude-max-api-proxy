@@ -19,6 +19,7 @@
 
 import { Router } from "express";
 import { spawn, execFile, ChildProcess } from "child_process";
+import { resolveClaudeBin } from "../subprocess/manager.js";
 
 type ReloginState = "idle" | "awaiting_code" | "success" | "failed";
 
@@ -29,6 +30,8 @@ interface ReloginSession {
   startedAt: number;
   proc: ChildProcess | null;
   buffer: string;
+  /** Set once /complete has written the code - stdin is closed after that */
+  codeSubmitted: boolean;
 }
 
 const SESSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 min to complete the flow
@@ -73,8 +76,11 @@ export function createAdminRouter(): Router {
 
     let proc: ChildProcess;
     try {
-      proc = spawn("claude", ["auth", "login"], {
+      // Same binary resolution as chat requests (honors CLAUDE_BIN)
+      const { bin, shell } = resolveClaudeBin();
+      proc = spawn(bin, ["auth", "login"], {
         stdio: ["pipe", "pipe", "pipe"],
+        shell,
       });
     } catch (err) {
       res.status(500).json({
@@ -83,56 +89,78 @@ export function createAdminRouter(): Router {
       return;
     }
 
-    session = {
+    const current: ReloginSession = {
       state: "awaiting_code",
       url: null,
       detail: null,
       startedAt: Date.now(),
       proc,
       buffer: "",
+      codeSubmitted: false,
     };
+    session = current;
 
+    // Handlers are bound to *this* flow: a killed predecessor closing later
+    // must not touch a newer session
     const onData = (chunk: Buffer) => {
-      if (!session) return;
-      session.buffer += chunk.toString();
-      if (!session.url) {
-        session.url = extractUrl(session.buffer);
-        if (session.url) {
+      current.buffer += chunk.toString();
+      if (!current.url) {
+        current.url = extractUrl(current.buffer);
+        if (current.url) {
           console.log("[Admin] Relogin URL ready");
         }
       }
     };
     proc.stdout?.on("data", onData);
     proc.stderr?.on("data", onData);
+    // Writing the code after the CLI exited raises EPIPE on stdin
+    proc.stdin?.on("error", (err) => {
+      console.error("[Admin] Relogin stdin error:", err.message);
+    });
+
+    proc.on("error", (err) => {
+      // e.g. ENOENT when the claude binary can't be found
+      current.state = "failed";
+      current.detail = `Failed to run claude CLI: ${err.message}`;
+      current.proc = null;
+      console.error(`[Admin] ${current.detail}`);
+    });
 
     proc.on("close", (code) => {
-      if (!session) return;
-      if (session.state === "success") return; // already completed via /complete
-      session.state = code === 0 ? "success" : "failed";
-      session.detail = `claude auth login exited with code ${code}`;
-      session.proc = null;
-      console.log(`[Admin] Relogin process closed: ${session.state}`);
+      if (current.state === "success") return; // already completed via /complete
+      current.state = code === 0 ? "success" : "failed";
+      current.detail = `claude auth login exited with code ${code}`;
+      current.proc = null;
+      console.log(`[Admin] Relogin process closed: ${current.state}`);
     });
 
     // Give the CLI a moment to print the URL before responding
     const deadline = Date.now() + 8000;
     const poll = setInterval(() => {
-      if (!session) {
+      if (session !== current || current.state === "failed") {
+        // Cancelled/replaced meanwhile, or the CLI couldn't start
         clearInterval(poll);
+        res.status(current.state === "failed" ? 500 : 409).json({
+          error: {
+            message: current.detail || "Login flow was cancelled or replaced.",
+            type: current.state === "failed" ? "server_error" : "invalid_request_error",
+            code: current.state === "failed" ? "relogin_failed" : "flow_replaced",
+          },
+        });
         return;
       }
-      if (session.url || Date.now() > deadline) {
+      if (current.url || Date.now() > deadline) {
         clearInterval(poll);
-        if (session.url) {
+        if (current.url) {
           res.json({
-            state: session.state,
-            url: session.url,
+            state: current.state,
+            url: current.url,
             instructions:
               "Open the URL in a browser, authorize, then POST the returned code to /admin/relogin/complete",
           });
         } else {
           res.status(202).json({
-            state: session.state,
+            state: current.state,
             url: null,
             note: "CLI started but has not printed a URL yet - poll GET /admin/relogin/status",
           });
@@ -163,6 +191,17 @@ export function createAdminRouter(): Router {
           message: "Login flow timed out (10 min). Start again with POST /admin/relogin/start.",
           type: "invalid_request_error",
           code: "flow_expired",
+        },
+      });
+      return;
+    }
+
+    if (session.codeSubmitted) {
+      res.status(409).json({
+        error: {
+          message: "A code was already submitted - poll GET /admin/relogin/status.",
+          type: "invalid_request_error",
+          code: "code_already_submitted",
         },
       });
       return;
@@ -204,8 +243,11 @@ export function createAdminRouter(): Router {
     };
 
     proc.once("close", onClose);
-    proc.stdin?.write(code + "\n");
-    proc.stdin?.end();
+    current.codeSubmitted = true;
+    if (proc.stdin?.writable) {
+      proc.stdin.write(code + "\n");
+      proc.stdin.end();
+    }
   });
 
   /**
@@ -244,10 +286,11 @@ export function createAdminRouter(): Router {
       return;
     }
 
+    const { bin, shell } = resolveClaudeBin();
     execFile(
-      "claude",
+      bin,
       ["--print", "/usage"],
-      { timeout: 20_000, maxBuffer: 64 * 1024 },
+      { timeout: 20_000, maxBuffer: 64 * 1024, shell },
       (err, stdout, stderr) => {
         if (err) {
           res.status(502).json({

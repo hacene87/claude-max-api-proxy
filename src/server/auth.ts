@@ -53,7 +53,14 @@ function loadOrCreateKeyFile(file: string): { key: string; generated: boolean } 
   try {
     writeFileSync(file, key + "\n", { mode: 0o600, flag: "wx" });
   } catch {
-    return { key: readFileSync(file, "utf8").trim(), generated: false };
+    const theirs = readFileSync(file, "utf8").trim();
+    if (!theirs) {
+      // Fail closed: an empty key file must never mean "no auth"
+      throw new Error(
+        `API key file ${file} exists but is empty - delete it to generate a new key, or set PROXY_API_KEY`
+      );
+    }
+    return { key: theirs, generated: false };
   }
   return { key, generated: true };
 }
@@ -168,7 +175,7 @@ export function apiKeyAuth(
   res: Response,
   next: NextFunction
 ): void {
-  if (!authEnabled || !configuredKey) {
+  if (!authEnabled) {
     next();
     return;
   }
@@ -183,7 +190,8 @@ export function apiKeyAuth(
   const header = req.headers.authorization;
   const token = header?.startsWith("Bearer ") ? header.slice(7).trim() : null;
 
-  if (!token || !safeEqual(token, configuredKey)) {
+  // A missing configured key while auth is on rejects everything (fail closed)
+  if (!token || !configuredKey || !safeEqual(token, configuredKey)) {
     res.status(401).json({
       error: {
         message:
