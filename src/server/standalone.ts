@@ -68,10 +68,15 @@ async function main(): Promise<void> {
 
   // API key authentication
   const keyStatus = initApiKey();
-  if (keyStatus.enabled && keyStatus.generated) {
-    console.log("[Auth] No PROXY_API_KEY configured - generated a random one:");
-    console.log(`[Auth]   ${keyStatus.key}`);
-    console.log("[Auth] Set PROXY_API_KEY in your environment to use your own.\n");
+  if (keyStatus.enabled && keyStatus.keyFile) {
+    // Never log the key itself - stdout usually ends up in a log file
+    console.log(
+      keyStatus.generated
+        ? "[Auth] No PROXY_API_KEY configured - generated a random key, saved to:"
+        : "[Auth] API key authentication: ENABLED, key loaded from:"
+    );
+    console.log(`[Auth]   ${keyStatus.keyFile}`);
+    console.log("[Auth] Clients must send it as 'Authorization: Bearer <key>'.\n");
   } else if (keyStatus.enabled) {
     console.log("[Auth] API key authentication: ENABLED\n");
   } else {

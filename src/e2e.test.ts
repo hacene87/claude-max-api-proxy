@@ -26,6 +26,8 @@ let server: Server;
 const TEST_TIMEOUT = 120_000;
 
 before(async () => {
+  // This suite checks the OpenAI response format; auth is covered by security.test.ts
+  process.env.PROXY_API_KEY = "off";
   server = await startServer({ port: 0 });
   const addr = server.address() as AddressInfo;
   baseUrl = `http://127.0.0.1:${addr.port}`;

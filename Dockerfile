@@ -34,6 +34,7 @@ USER proxyapp
 # Claude CLI config/credentials live here - mount a volume on /data
 ENV HOME=/home/proxyapp \
     CLAUDE_CONFIG_DIR=/data/.claude \
+    PROXY_API_KEY_FILE=/data/api-key \
     HOST=0.0.0.0 \
     PORT=3456
 

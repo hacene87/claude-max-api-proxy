@@ -28,6 +28,8 @@ import {
 } from "../types/claude-cli.js";
 import type { ClaudeModel, CliImage, ClaudeEffort } from "../adapter/openai-to-cli.js";
 import os from "os";
+import { lookup } from "dns/promises";
+import { BlockList, isIP } from "net";
 
 export interface SubprocessOptions {
   model: ClaudeModel;
@@ -88,6 +90,63 @@ export function isAuthError(stderr: string, exitCode: number | null): boolean {
   );
 }
 
+/** Addresses a request-supplied image URL must never reach (SSRF) */
+const PRIVATE_ADDRESSES = new BlockList();
+for (const [net, bits] of [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+  ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.168.0.0", 16],
+  ["198.18.0.0", 15], ["224.0.0.0", 4], ["240.0.0.0", 4],
+] as const) {
+  PRIVATE_ADDRESSES.addSubnet(net, bits, "ipv4");
+}
+for (const [net, bits] of [
+  ["::", 128], ["::1", 128], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
+] as const) {
+  PRIVATE_ADDRESSES.addSubnet(net, bits, "ipv6");
+}
+
+function isPrivateAddress(address: string): boolean {
+  const mapped = address.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (mapped) return PRIVATE_ADDRESSES.check(mapped[1], "ipv4");
+  return PRIVATE_ADDRESSES.check(address, isIP(address) === 6 ? "ipv6" : "ipv4");
+}
+
+/**
+ * Only public http(s) hosts may be fetched, so an image_url can't be used to
+ * reach localhost, the LAN or cloud metadata endpoints from this machine.
+ * ALLOW_PRIVATE_IMAGE_URLS=true lifts the address check (e.g. a LAN image host).
+ */
+async function assertFetchableImageUrl(raw: string): Promise<URL> {
+  const url = new URL(raw);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`Unsupported image URL protocol: ${url.protocol}`);
+  }
+  if (process.env.ALLOW_PRIVATE_IMAGE_URLS === "true") return url;
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  const addresses = isIP(hostname)
+    ? [hostname]
+    : (await lookup(hostname, { all: true })).map((a) => a.address);
+  if (addresses.length === 0 || addresses.some(isPrivateAddress)) {
+    throw new Error(`Image URL host not allowed: ${url.hostname}`);
+  }
+  return url;
+}
+
+/** fetch() that re-validates every redirect hop against the SSRF rules */
+async function fetchImage(raw: string): Promise<globalThis.Response> {
+  let url = await assertFetchableImageUrl(raw);
+  for (let hop = 0; hop < 5; hop++) {
+    const res = await fetch(url, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(5000),
+    });
+    const location = res.headers.get("location");
+    if (res.status < 300 || res.status >= 400 || !location) return res;
+    url = await assertFetchableImageUrl(new URL(location, url).toString());
+  }
+  throw new Error("Too many redirects");
+}
+
 /**
  * Stage request images as temp files so the CLI can read them via the Read tool.
  * Returns absolute file paths. Caller is responsible for cleanup.
@@ -104,13 +163,15 @@ export async function stageImages(images: CliImage[]): Promise<string[]> {
       let mime = img.mimeType;
 
       if (img.sourceUrl) {
-        const res = await fetch(img.sourceUrl, {
-          signal: AbortSignal.timeout(5000),
-        });
+        const res = await fetchImage(img.sourceUrl);
         if (!res.ok || !res.body) continue;
         const contentLength = Number(res.headers.get("content-length") || 0);
         if (contentLength > MAX_IMAGE_BYTES) continue;
-        mime = mime || res.headers.get("content-type") || "";
+        // Only stage real images - anything else would be handed to Claude's
+        // Read tool as a file and could be echoed back to the caller
+        const contentType = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+        if (!contentType.startsWith("image/")) continue;
+        mime = mime || contentType;
         // Enforce the size limit while streaming: abort as soon as the body
         // exceeds MAX_IMAGE_BYTES instead of buffering unbounded data first
         const chunks: Buffer[] = [];

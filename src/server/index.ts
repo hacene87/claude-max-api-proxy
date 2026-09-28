@@ -7,7 +7,7 @@
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server } from "http";
 import { handleChatCompletions, handleModels, handleHealth } from "./routes.js";
-import { apiKeyAuth, adminAuth } from "./auth.js";
+import { apiKeyAuth, adminAuth, initApiKey } from "./auth.js";
 import { createAdminRouter } from "./admin.js";
 
 export interface ServerConfig {
@@ -17,11 +17,52 @@ export interface ServerConfig {
 
 let serverInstance: Server | null = null;
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+
+function parseList(value: string | undefined): string[] {
+  return (value || "").split(",").map((v) => v.trim()).filter(Boolean);
+}
+
+/**
+ * Host names (without port) the server answers to. Blocks DNS rebinding:
+ * a hostile page that re-points its own domain at 127.0.0.1 still sends its
+ * own domain in the Host header.
+ * - ALLOWED_HOSTS env (comma-separated, "*" disables the check) wins.
+ * - Bound to loopback: only localhost names.
+ * - Bound to a routable address (e.g. 0.0.0.0 in Docker): not checked,
+ *   the API key is the protection there.
+ */
+function allowedHostnames(bindHost: string): Set<string> | null {
+  const configured = parseList(process.env.ALLOWED_HOSTS).map((h) => h.toLowerCase());
+  if (configured.includes("*")) return null;
+  if (configured.length > 0) return new Set(configured);
+  if (LOOPBACK_HOSTS.has(bindHost)) return new Set(LOOPBACK_HOSTS);
+  return null;
+}
+
+function hostnameOf(hostHeader: string): string {
+  // "[::1]:3456" -> "::1", "localhost:3456" -> "localhost"
+  const bracketed = hostHeader.match(/^\[([^\]]+)\]/);
+  if (bracketed) return bracketed[1].toLowerCase();
+  return hostHeader.replace(/:\d+$/, "").toLowerCase();
+}
+
 /**
  * Create and configure the Express app
  */
-function createApp(): Express {
+function createApp(bindHost: string): Express {
   const app = express();
+
+  // Reject requests addressed to a foreign Host (DNS rebinding)
+  const hosts = allowedHostnames(bindHost);
+  if (hosts) {
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (hosts.has(hostnameOf(req.headers.host || ""))) return next();
+      res.status(403).json({
+        error: { message: "Host not allowed", type: "invalid_request_error", code: "host_not_allowed" },
+      });
+    });
+  }
 
   // Middleware: use raw body parser + manual JSON parse for better error diagnostics
   app.use(express.raw({ type: "application/json", limit: "10mb" }));
@@ -59,17 +100,24 @@ function createApp(): Express {
     next();
   });
 
-  // CORS headers for local development
-  app.use((_req: Request, res: Response, next: NextFunction) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  // CORS: browsers may only call the proxy from explicitly allowed origins
+  // (CORS_ORIGINS env, comma-separated). By default no origin is allowed, so a
+  // web page the user happens to visit cannot drive the local CLI.
+  const corsOrigins = new Set(parseList(process.env.CORS_ORIGINS));
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const origin = req.headers.origin;
+    const allowed = !!origin && corsOrigins.has(origin);
+    if (allowed) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    }
+    if (req.method === "OPTIONS") {
+      res.sendStatus(allowed ? 204 : 403);
+      return;
+    }
     next();
-  });
-
-  // Handle OPTIONS preflight
-  app.options("*", (_req: Request, res: Response) => {
-    res.sendStatus(200);
   });
 
   // API key authentication (protects all routes except /health, see auth.ts)
@@ -120,7 +168,11 @@ export async function startServer(config: ServerConfig): Promise<Server> {
     return serverInstance;
   }
 
-  const app = createApp();
+  // Every entry point (standalone, OpenClaw plugin, CLI command) goes through
+  // here, so auth can't be skipped by starting the server another way
+  initApiKey();
+
+  const app = createApp(host);
 
   return new Promise((resolve, reject) => {
     serverInstance = createServer(app);
