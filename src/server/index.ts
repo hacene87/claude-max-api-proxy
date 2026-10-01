@@ -65,8 +65,10 @@ function createApp(bindHost: string): Express {
   }
 
   // Middleware: use raw body parser + manual JSON parse for better error diagnostics
-  app.use(express.raw({ type: "application/json", limit: "10mb" }));
-  app.use((req: Request, _res: Response, next: NextFunction) => {
+  // Base64 inflates images by a third, so the body limit must sit well above
+  // the per-image limit (MAX_IMAGE_MB, default 75) - override with MAX_BODY_SIZE
+  app.use(express.raw({ type: "application/json", limit: process.env.MAX_BODY_SIZE || "110mb" }));
+  app.use((req: Request, res: Response, next: NextFunction) => {
     if (req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
       const raw = req.body.toString("utf8");
       if (process.env.DEBUG) {
@@ -86,7 +88,15 @@ function createApp(bindHost: string): Express {
             url: req.originalUrl,
           });
         }
-        return next(err);
+        // Malformed JSON is the client's fault: answer like OpenAI does
+        res.status(400).json({
+          error: {
+            message: `Invalid JSON in request body: ${msg}`,
+            type: "invalid_request_error",
+            code: "invalid_json",
+          },
+        });
+        return;
       }
     }
     next();
@@ -143,7 +153,21 @@ function createApp(bindHost: string): Express {
   });
 
   // Error handler
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: Error & { status?: number; statusCode?: number }, _req: Request, res: Response, _next: NextFunction) => {
+    // Body-parser errors (e.g. payload too large) carry a 4xx status: those
+    // are client errors and must not be reported as server failures
+    const status = err.status ?? err.statusCode;
+    if (typeof status === "number" && status >= 400 && status < 500) {
+      console.error(`[Client Error ${status}]:`, err.message);
+      res.status(status).json({
+        error: {
+          message: err.message,
+          type: "invalid_request_error",
+          code: null,
+        },
+      });
+      return;
+    }
     console.error("[Server Error]:", err.message);
     res.status(500).json({
       error: {

@@ -2,6 +2,20 @@
 
 This guide shows how to configure the Claude Code CLI Provider to start automatically when you log in.
 
+## Quick setup (recommended)
+
+From the repository root, run:
+
+```bash
+npm run deploy
+```
+
+This installs the LaunchAgent `com.openclaw.claude-max-proxy` if it is missing
+(with the right `node`/`claude` paths, the repo as working directory so `.env`
+is loaded, and logs in `~/.openclaw/logs`), builds, starts it and checks
+`/health`. Run the same command to deploy later updates. The manual steps below
+are only needed for a custom setup.
+
 ## Create LaunchAgent
 
 1. Create the plist file:

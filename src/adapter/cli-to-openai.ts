@@ -44,14 +44,15 @@ export function cliToOpenaiChunk(
 }
 
 /**
- * Create a final "done" chunk for streaming
+ * Create a final "done" chunk for streaming. `model` is reported verbatim
+ * (callers pass the model name the client requested).
  */
 export function createDoneChunk(requestId: string, model: string): OpenAIChatChunk {
   return {
     id: `chatcmpl-${requestId}`,
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
-    model: normalizeModelName(model),
+    model,
     choices: [
       {
         index: 0,
@@ -63,17 +64,18 @@ export function createDoneChunk(requestId: string, model: string): OpenAIChatChu
 }
 
 /**
- * Convert Claude CLI result to OpenAI non-streaming response
+ * Convert Claude CLI result to OpenAI non-streaming response.
+ * `responseModel` (the model name the client requested) is reported verbatim
+ * when given; otherwise the model the CLI actually used is normalized.
  */
 export function cliResultToOpenai(
   result: ClaudeCliResult,
   requestId: string,
-  toolCalls?: OpenAIToolCall[]
+  toolCalls?: OpenAIToolCall[],
+  responseModel?: string
 ): OpenAIChatResponse {
-  // Get model from modelUsage or default
-  const modelName = result.modelUsage
-    ? Object.keys(result.modelUsage)[0]
-    : "claude-sonnet-4";
+  const modelName = responseModel
+    ?? normalizeModelName(result.modelUsage ? Object.keys(result.modelUsage)[0] : undefined);
 
   const message: OpenAIChatResponse["choices"][0]["message"] = {
     role: "assistant",
@@ -96,7 +98,7 @@ export function cliResultToOpenai(
     id: `chatcmpl-${requestId}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: normalizeModelName(modelName),
+    model: modelName,
     choices: [
       {
         index: 0,

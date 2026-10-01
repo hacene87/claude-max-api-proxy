@@ -159,11 +159,17 @@ export async function handleChatCompletions(
       return;
     }
 
+    // Echo the model name the client asked for, as OpenAI does. The CLI may
+    // resolve an alias to a newer model, and reporting that name back would
+    // surprise clients that match on the field (and differ between chunks).
+    const responseModel =
+      typeof body.model === "string" && body.model ? body.model : "claude-sonnet-4";
+
     // Fresh container without any login: answer upfront instead of
     // letting the request run into the CLI's onboarding failure
     if (!hasClaudeCredentials()) {
       console.error("[Auth] No Claude credentials found - prompting admin to run the relogin flow");
-      const guidance = authExpiredResponse(requestId, "claude-sonnet-4");
+      const guidance = authExpiredResponse(requestId, responseModel);
       if (stream) {
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
@@ -210,9 +216,9 @@ export async function handleChatCompletions(
 
     try {
       if (stream) {
-        await handleStreamingResponse(req, res, subprocess, cliInput, requestId, sessionCtx);
+        await handleStreamingResponse(req, res, subprocess, cliInput, requestId, sessionCtx, responseModel);
       } else {
-        await handleNonStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx);
+        await handleNonStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx, responseModel);
       }
     } finally {
       if (stagedImages.length > 0) {
@@ -256,7 +262,8 @@ async function handleStreamingResponse(
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
-  sessionCtx: SessionContext
+  sessionCtx: SessionContext,
+  responseModel: string
 ): Promise<void> {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -273,7 +280,6 @@ async function handleStreamingResponse(
 
   return new Promise<void>((resolve, reject) => {
     let isFirst = true;
-    let lastModel = "claude-sonnet-4";
     let isComplete = false;
     let hasEmittedText = false;
     let toolCallIndex = 0;
@@ -300,7 +306,7 @@ async function handleStreamingResponse(
           id: `chatcmpl-${requestId}`,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
-          model: lastModel,
+          model: responseModel,
           choices: [{
             index: 0,
             delta: {
@@ -325,7 +331,7 @@ async function handleStreamingResponse(
           id: `chatcmpl-${requestId}`,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
-          model: lastModel,
+          model: responseModel,
           choices: [{
             index: 0,
             delta: { reasoning: text },
@@ -357,7 +363,7 @@ async function handleStreamingResponse(
           id: `chatcmpl-${requestId}`,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
-          model: lastModel,
+          model: responseModel,
           choices: [{
             index: 0,
             delta: {
@@ -389,7 +395,7 @@ async function handleStreamingResponse(
     //     id: `chatcmpl-${requestId}`,
     //     object: "chat.completion.chunk",
     //     created: Math.floor(Date.now() / 1000),
-    //     model: lastModel,
+    //     model: responseModel,
     //     choices: [{
     //       index: 0,
     //       delta: {
@@ -420,7 +426,7 @@ async function handleStreamingResponse(
     //     id: `chatcmpl-${requestId}`,
     //     object: "chat.completion.chunk",
     //     created: Math.floor(Date.now() / 1000),
-    //     model: lastModel,
+    //     model: responseModel,
     //     choices: [{
     //       index: 0,
     //       delta: {
@@ -444,11 +450,6 @@ async function handleStreamingResponse(
     //   }
     // });
 
-    // Handle final assistant message (for model name)
-    subprocess.on("assistant", (message: ClaudeCliAssistant) => {
-      lastModel = message.message.model;
-    });
-
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
       if (sessionCtx.sessionKey && cliInput.sessionId) {
@@ -464,7 +465,7 @@ async function handleStreamingResponse(
             id: `chatcmpl-${requestId}`,
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
-            model: lastModel,
+            model: responseModel,
             choices: [{
               index: 0,
               delta: {
@@ -492,7 +493,7 @@ async function handleStreamingResponse(
           id: `chatcmpl-${requestId}`,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
-          model: lastModel,
+          model: responseModel,
           choices: [{
             index: 0,
             delta: { role: "assistant", content: accumulatedText },
@@ -505,7 +506,7 @@ async function handleStreamingResponse(
       }
       if (!res.writableEnded) {
         // Send final done chunk with finish_reason and usage data
-        const doneChunk = createDoneChunk(requestId, lastModel);
+        const doneChunk = createDoneChunk(requestId, responseModel);
         if (result.usage || result.modelUsage) {
           const muValues = Object.values(result.modelUsage || {});
           const promptTokens = result.usage?.input_tokens
@@ -546,7 +547,7 @@ async function handleStreamingResponse(
             id: `chatcmpl-${requestId}`,
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
-            model: lastModel,
+            model: responseModel,
             choices: [{ index: 0, delta: { role: "assistant", content: AUTH_EXPIRED_MESSAGE }, finish_reason: null }],
           };
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
@@ -581,7 +582,7 @@ async function handleStreamingResponse(
             id: `chatcmpl-${requestId}`,
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
-            model: lastModel,
+            model: responseModel,
             choices: [{ index: 0, delta: { role: "assistant", content: AUTH_EXPIRED_MESSAGE }, finish_reason: null }],
           };
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
@@ -593,7 +594,7 @@ async function handleStreamingResponse(
         }
       }
       if (!res.writableEnded) {
-        const closeDoneChunk = createDoneChunk(requestId, lastModel);
+        const closeDoneChunk = createDoneChunk(requestId, responseModel);
         res.write(`data: ${JSON.stringify(closeDoneChunk)}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
@@ -634,7 +635,8 @@ async function handleNonStreamingResponse(
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
-  sessionCtx: SessionContext
+  sessionCtx: SessionContext,
+  responseModel: string
 ): Promise<void> {
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
@@ -671,7 +673,7 @@ async function handleNonStreamingResponse(
       }
       if (subprocess.hasAuthError()) {
         console.error("[Auth] Claude CLI authentication expired - user notified in chat");
-        res.json(authExpiredResponse(requestId, "claude-sonnet-4"));
+        res.json(authExpiredResponse(requestId, responseModel));
         resolve();
         return;
       }
@@ -704,7 +706,7 @@ async function handleNonStreamingResponse(
               id: `chatcmpl-${requestId}`,
               object: "chat.completion",
               created: Math.floor(Date.now() / 1000),
-              model: "claude-sonnet-4",
+              model: responseModel,
               choices: [{
                 index: 0,
                 message: {
@@ -730,7 +732,7 @@ async function handleNonStreamingResponse(
             return;
           }
         }
-        res.json(cliResultToOpenai(finalResult, requestId));
+        res.json(cliResultToOpenai(finalResult, requestId, undefined, responseModel));
       } else {
         if (sessionCtx.resume && sessionCtx.sessionKey) {
           clearSession(sessionCtx.sessionKey);
@@ -738,7 +740,7 @@ async function handleNonStreamingResponse(
         if (!res.headersSent) {
           if (subprocess.hasAuthError()) {
             console.error("[Auth] Claude CLI authentication expired - user notified in chat");
-            res.json(authExpiredResponse(requestId, "claude-sonnet-4"));
+            res.json(authExpiredResponse(requestId, responseModel));
           } else {
             res.status(500).json({
               error: {

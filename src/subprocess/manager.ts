@@ -50,8 +50,39 @@ export interface SubprocessOptions {
   allowImageRead?: boolean;
 }
 
-/** Max size per image (decoded), 20 MB - generous but bounded */
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+/** Positive number from an env var, or the fallback when unset/invalid */
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/**
+ * Max size per incoming image (decoded). Read per call so it can be tuned
+ * via MAX_IMAGE_MB without a rebuild. Default 75 MB: large scans and camera
+ * photos are accepted and then shrunk by optimizeImage() before staging.
+ */
+function maxImageBytes(): number {
+  return envNumber("MAX_IMAGE_MB", 75) * 1024 * 1024;
+}
+
+/**
+ * Longest edge (px) an image is downscaled to before Claude sees it.
+ * 0 disables resizing and re-encoding entirely.
+ */
+function imageMaxEdge(): number {
+  return Math.floor(envNumber("IMAGE_MAX_EDGE", 2576));
+}
+
+/** Images above this size are re-encoded even when their dimensions fit */
+const REENCODE_ABOVE_BYTES = 3.5 * 1024 * 1024;
+
+/**
+ * Refuse to decode images above this many pixels (decompression bombs: a tiny
+ * file can declare huge dimensions). 120 MP covers real cameras and scans.
+ */
+const MAX_DECODE_PIXELS = 120_000_000;
 
 const MIME_TO_EXT: Record<string, string> = {
   "image/png": ".png",
@@ -177,10 +208,71 @@ async function fetchImage(raw: string): Promise<IncomingMessage> {
   throw new Error("Too many redirects");
 }
 
+type SharpModule = typeof import("sharp").default;
+let sharpLoader: Promise<SharpModule | null> | undefined;
+
+/** sharp is loaded lazily; when it is unavailable images pass through as-is */
+function loadSharp(): Promise<SharpModule | null> {
+  sharpLoader ??= import("sharp")
+    .then((m) => m.default)
+    .catch((err) => {
+      console.warn("[Images] sharp unavailable - large images are not resized:", String(err));
+      return null;
+    });
+  return sharpLoader;
+}
+
+/**
+ * Shrink an image so Claude can always read it: downscale so the longest edge
+ * is at most IMAGE_MAX_EDGE, honor EXIF rotation, and re-encode. Images that
+ * already fit (dimensions, size, and a format Claude reads) are returned
+ * untouched. On any failure the original is returned.
+ */
+export async function optimizeImage(
+  buffer: Buffer,
+  mime: string
+): Promise<{ buffer: Buffer; mime: string }> {
+  const maxEdge = imageMaxEdge();
+  if (maxEdge <= 0) return { buffer, mime };
+  const sharp = await loadSharp();
+  if (!sharp) return { buffer, mime };
+
+  try {
+    const meta = await sharp(buffer, { limitInputPixels: MAX_DECODE_PIXELS }).metadata();
+    const width = meta.autoOrient?.width ?? meta.width ?? 0;
+    const height = meta.autoOrient?.height ?? meta.height ?? 0;
+    const supported = !!MIME_TO_EXT[mime];
+    const needsWork =
+      Math.max(width, height) > maxEdge ||
+      buffer.length > REENCODE_ABOVE_BYTES ||
+      !supported ||
+      (meta.orientation ?? 1) > 1;
+    if (!needsWork) return { buffer, mime };
+
+    const base = () =>
+      sharp(buffer, { limitInputPixels: MAX_DECODE_PIXELS })
+        .rotate() // apply EXIF orientation so phone photos are upright
+        .resize({ width: maxEdge, height: maxEdge, fit: "inside", withoutEnlargement: true });
+
+    // Screenshots and graphics stay PNG (sharp text, transparency) when that
+    // stays small; everything else becomes high-quality JPEG
+    if (meta.hasAlpha || mime === "image/png" || mime === "image/gif") {
+      const png = await base().png({ compressionLevel: 9 }).toBuffer();
+      if (png.length <= REENCODE_ABOVE_BYTES) return { buffer: png, mime: "image/png" };
+    }
+    const jpeg = await base().flatten({ background: "#ffffff" }).jpeg({ quality: 90 }).toBuffer();
+    return { buffer: jpeg, mime: "image/jpeg" };
+  } catch (err) {
+    console.warn("[Images] could not optimize image, using original:", String(err));
+    return { buffer, mime };
+  }
+}
+
 /**
  * Stage request images as temp files so the CLI can read them via the Read tool.
  * Returns absolute file paths. Caller is responsible for cleanup.
- * Remote URLs are downloaded (5s timeout, bounded size).
+ * Remote URLs are downloaded (5s timeout, bounded size). Large images are
+ * downscaled and re-encoded first (see optimizeImage).
  */
 export async function stageImages(images: CliImage[]): Promise<string[]> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "cmap-img-"));
@@ -199,19 +291,19 @@ export async function stageImages(images: CliImage[]): Promise<string[]> {
         // Only stage real images - anything else would be handed to Claude's
         // Read tool as a file and could be echoed back to the caller
         const contentType = (res.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
-        if (status < 200 || status >= 300 || contentLength > MAX_IMAGE_BYTES || !contentType.startsWith("image/")) {
+        if (status < 200 || status >= 300 || contentLength > maxImageBytes() || !contentType.startsWith("image/")) {
           res.destroy();
           continue;
         }
         mime = mime || contentType;
         // Enforce the size limit while streaming: abort as soon as the body
-        // exceeds MAX_IMAGE_BYTES instead of buffering unbounded data first
+        // exceeds the per-image limit instead of buffering unbounded data first
         const chunks: Buffer[] = [];
         let received = 0;
         let tooLarge = false;
         for await (const chunk of res) {
           received += (chunk as Buffer).length;
-          if (received > MAX_IMAGE_BYTES) {
+          if (received > maxImageBytes()) {
             tooLarge = true;
             break;
           }
@@ -226,7 +318,8 @@ export async function stageImages(images: CliImage[]): Promise<string[]> {
         buffer = Buffer.from(img.data, "base64");
       }
 
-      if (buffer.length === 0 || buffer.length > MAX_IMAGE_BYTES) continue;
+      if (buffer.length === 0 || buffer.length > maxImageBytes()) continue;
+      ({ buffer, mime } = await optimizeImage(buffer, mime));
       const ext = MIME_TO_EXT[mime] || ".png";
       const file = path.join(dir, `image-${i + 1}${ext}`);
       await fs.writeFile(file, buffer);

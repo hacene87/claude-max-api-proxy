@@ -14,6 +14,7 @@
     "start": "node dist/server/standalone.js",
     "test": "node --test dist/**/*.test.js",
     "clean": "rm -rf dist",
+    "deploy": "bash scripts/deploy.sh",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -40,6 +41,7 @@
   "homepage": "https://github.com/atalovesyou/claude-max-api-proxy#readme",
   "dependencies": {
     "express": "^4.21.2",
+    "sharp": "^0.35.5",
     "uuid": "^11.0.5"
   },
   "devDependencies": {
