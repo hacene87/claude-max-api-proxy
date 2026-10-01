@@ -120,7 +120,7 @@ describe("non-streaming completion", { timeout: TEST_TIMEOUT }, () => {
     assert.ok(body.id, "missing id");
     assert.equal(body.object, "chat.completion");
     assert.ok(typeof body.created === "number");
-    assert.ok(body.model, "missing model");
+    assert.equal(body.model, "claude-haiku-4", "model should echo the request");
 
     // Choices
     assert.ok(Array.isArray(body.choices));
@@ -219,7 +219,7 @@ describe("streaming completion", { timeout: TEST_TIMEOUT }, () => {
       assert.ok(chunk.id, "chunk missing id");
       assert.equal(chunk.object, "chat.completion.chunk");
       assert.ok(typeof chunk.created === "number");
-      assert.ok(chunk.model, "chunk missing model");
+      assert.equal(chunk.model, "claude-haiku-4", "chunk model should echo the request");
       assert.ok(Array.isArray(chunk.choices));
       assert.equal(chunk.choices.length, 1);
     }

@@ -85,6 +85,41 @@ describe("CORS", () => {
   });
 });
 
+function post(
+  path: string,
+  body: string | Buffer,
+  headers: Record<string, string> = {}
+): Promise<{ status: number; json: any }> {
+  return new Promise((resolve, reject) => {
+    const req = request(
+      { host: "127.0.0.1", port, method: "POST", path, headers: { "Content-Type": "application/json", ...headers } },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve({ status: res.statusCode!, json: data ? JSON.parse(data) : null }));
+      }
+    );
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+describe("request body errors", () => {
+  it("answers malformed JSON with 400 invalid_request_error", async () => {
+    const res = await post("/v1/chat/completions", "{bad", { Authorization: `Bearer ${KEY}` });
+    assert.equal(res.status, 400);
+    assert.equal(res.json.error.type, "invalid_request_error");
+    assert.equal(res.json.error.code, "invalid_json");
+  });
+
+  it("answers an oversized body with 413, not 500", async () => {
+    const big = Buffer.alloc(11 * 1024 * 1024, 0x20);
+    const res = await post("/v1/chat/completions", big, { Authorization: `Bearer ${KEY}` });
+    assert.equal(res.status, 413);
+    assert.equal(res.json.error.type, "invalid_request_error");
+  });
+});
+
 describe("Host header (DNS rebinding)", () => {
   it("rejects a foreign Host", async () => {
     const res = await call("GET", "/health", { Host: `evil.example:${port}` });
