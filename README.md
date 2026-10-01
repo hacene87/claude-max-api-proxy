@@ -182,6 +182,22 @@ The proxy can run as a macOS LaunchAgent on port 3456.
 
 **Plist location:** `~/Library/LaunchAgents/com.openclaw.claude-max-proxy.plist`
 
+### Deploy / update
+
+`scripts/deploy.sh` pulls `main`, runs `npm ci`, builds, runs the unit tests,
+restarts the LaunchAgent and waits for `/health`. If the plist is missing it
+installs one (logs in `~/.openclaw/logs`). If the new version is unhealthy it
+rolls back to the previous commit automatically.
+
+```bash
+npm run deploy                        # or: scripts/deploy.sh
+scripts/deploy.sh --branch my-branch  # deploy another branch
+scripts/deploy.sh --reinstall-plist   # regenerate the plist (old one backed up)
+scripts/deploy.sh --help              # all options
+```
+
+### Manual service commands
+
 ```bash
 # Start the service
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openclaw.claude-max-proxy.plist

@@ -13,6 +13,8 @@ npm run dev      # Watch mode for development
 
 The proxy runs as a macOS LaunchAgent on port 3456.
 
+**Deploy an update:** `npm run deploy` (see `scripts/deploy.sh --help`). It pulls `main`, builds, runs unit tests, restarts the LaunchAgent, health-checks and rolls back on failure. It refuses to run with uncommitted changes.
+
 **Plist location:** `~/Library/LaunchAgents/com.openclaw.claude-max-proxy.plist`
 
 **Logs:**

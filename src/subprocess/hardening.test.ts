@@ -7,7 +7,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import sharp from "sharp";
@@ -39,11 +39,20 @@ describe("CLI tool flags", () => {
 
 describe("image staging", () => {
   it("leaves no temp dir behind when nothing is staged", async () => {
-    const before = readdirSync(tmpdir()).filter((d) => d.startsWith("cmap-img-")).length;
-    const paths = await stageImages([{ mimeType: "", data: "", sourceUrl: "http://127.0.0.1/x.png" }]);
-    assert.deepEqual(paths, []);
-    const after = readdirSync(tmpdir()).filter((d) => d.startsWith("cmap-img-")).length;
-    assert.equal(after, before);
+    // Use a private temp root: test files run in parallel processes, and
+    // other suites stage (and clean up) images in the shared tmpdir
+    const privateTmp = mkdtempSync(path.join(tmpdir(), "cmap-test-"));
+    const savedTmp = process.env.TMPDIR;
+    process.env.TMPDIR = privateTmp; // os.tmpdir() reads TMPDIR on each call
+    try {
+      const paths = await stageImages([{ mimeType: "", data: "", sourceUrl: "http://127.0.0.1/x.png" }]);
+      assert.deepEqual(paths, []);
+      assert.deepEqual(readdirSync(privateTmp), []);
+    } finally {
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+      rmSync(privateTmp, { recursive: true, force: true });
+    }
   });
 });
 
