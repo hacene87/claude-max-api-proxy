@@ -65,7 +65,9 @@ function createApp(bindHost: string): Express {
   }
 
   // Middleware: use raw body parser + manual JSON parse for better error diagnostics
-  app.use(express.raw({ type: "application/json", limit: "10mb" }));
+  // Base64 inflates images by a third, so the body limit must sit well above
+  // the per-image limit (MAX_IMAGE_MB, default 75) - override with MAX_BODY_SIZE
+  app.use(express.raw({ type: "application/json", limit: process.env.MAX_BODY_SIZE || "110mb" }));
   app.use((req: Request, res: Response, next: NextFunction) => {
     if (req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
       const raw = req.body.toString("utf8");

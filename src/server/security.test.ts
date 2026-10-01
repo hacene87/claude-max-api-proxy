@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { request, createServer } from "node:http";
 import type { AddressInfo } from "net";
 import { startServer, stopServer } from "./index.js";
-import { stageImages } from "../subprocess/manager.js";
+import { cleanupImages, stageImages } from "../subprocess/manager.js";
 
 const KEY = "sk-proxy-test-key";
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
@@ -36,6 +36,7 @@ before(async () => {
   process.env.PROXY_API_KEY = KEY;
   delete process.env.CORS_ORIGINS;
   delete process.env.ALLOWED_HOSTS;
+  process.env.MAX_BODY_SIZE = "10mb"; // keep the oversized-body test cheap
   const server = await startServer({ port: 0 });
   port = (server.address() as AddressInfo).port;
 });
@@ -168,6 +169,7 @@ describe("image URL SSRF guard", () => {
       ]);
       assert.equal(paths.length, 2);
       assert.ok(paths.every((p) => p.endsWith(".png")));
+      await cleanupImages(paths);
     } finally {
       delete process.env.ALLOW_PRIVATE_IMAGE_URLS;
       imgServer.close();
@@ -177,5 +179,6 @@ describe("image URL SSRF guard", () => {
   it("still stages inline base64 images", async () => {
     const paths = await stageImages([{ mimeType: "image/png", data: PNG }]);
     assert.equal(paths.length, 1);
+    await cleanupImages(paths);
   });
 });
